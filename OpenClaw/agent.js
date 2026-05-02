@@ -1,7 +1,7 @@
 import Groq from "groq-sdk";
 import dotenv from "dotenv";
-import { zodTextFormat } from "openai/helpers/zod";
 import { execSync } from "node:child_process";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -13,6 +13,15 @@ const client = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
+function executeCommand(cmd = "") {
+  try {
+    const result = execSync(cmd, { encoding: "utf-8" });
+    return result;
+  } catch (err) {
+    return err.message;
+  }
+}
+
 const functionMapping = {
   executeCommand,
 };
@@ -23,79 +32,105 @@ const SYSTEM_PROMPT = `You are an expert AI Assistant that is expert in controll
     - executeCommand(command: string): Output from the command 
     
     You can you the executeCommand tool to execute any command on user's machine
-`;
+    IMPORTANT:
+You MUST ONLY respond in valid JSON.
 
-const outputSchema = z.object({
-  type: z.enum(["tool_call", "text"]).describe("what kind of response this is"),
-  text_content: z
-    .string()
-    .optional()
-    .nulable()
-    .describe("text content if type is text"),
-  tool_call: z
-    .object({
-      tool_name: z.string().describe("name of the tool"),
-      params: z.array(z.string()),
-    })
-    .optional()
-    .nullable()
-    .describe("the params to call the tool if type is tool_call"),
-});
+Do NOT return explanations, markdown, or text.
 
-function executeCommand(cmd = "") {
-  try {
-    const result = execSync(cmd, { encoding: "utf-8" });
-    return result;
-  } catch (err) {
-    return err.message;
+Valid formats:
+
+For tool call:
+{
+  "type": "tool_call",
+  "finalOutput": false,
+  "tool_call": {
+    "tool_name": "executeCommand",
+    "params": ["mkdir test"]
   }
 }
 
+For final response:
+{
+  "type": "text",
+  "finalOutput": true,
+  "text_content": "Folder created successfully"
+}
+    `;
+
+const outputSchema = z.object({
+  type: z.enum(["tool_call", "text"]),
+  finalOutput: z.boolean(),
+  text_content: z.string().optional().nullable(),
+  tool_call: z
+    .object({
+      tool_name: z.string(),
+      params: z.array(z.string()),
+    })
+    .optional()
+    .nullable(),
+});
+
 const messages = [{ role: "system", content: SYSTEM_PROMPT }];
-// main function
+
 export async function run(query = "") {
-    messages.push({role:'user',content:query,})
+  messages.push({ role: "user", content: query });
+
   while (true) {
     try {
       const response = await client.chat.completions.create({
         model: "llama-3.3-70b-versatile",
-        text: {
-          format: zodTextFormat(outputSchema, "output"),
-        },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: query },
-        ],
+        messages: messages,
         temperature: 0.5,
         max_tokens: 1024,
       });
 
-      const parsedOutput = result.output_parsed;
+      const rawOutput = response.choices[0].message.content;
+
+      let parsedOutput;
+      try {
+        parsedOutput = outputSchema.parse(JSON.parse(rawOutput));
+      } catch (e) {
+        console.log("Invalid JSON from model:", rawOutput);
+        return rawOutput;
+      }
+
+      messages.push({
+        role: "assistant",
+        content: rawOutput,
+      });
+
       switch (parsedOutput.type) {
-        case "tool_call":
-          {
-            if (parsedOuput.tool_call) {
-              const { params, tool_name } = parsedOutput.tool_call;
-              console.log(`tool call: ${tool_name} :${params}`);
-              if (functionMapping[tool_name]) {
-                const toolOutput = functionMapping[tool_name](...params);
-                console.log(`Tool Output (${tool_name}})`, toolOutput);
-              }
+        case "tool_call": {
+          if (parsedOutput.tool_call) {
+            const { params, tool_name } = parsedOutput.tool_call;
+
+            console.log(`Tool Call → ${tool_name}:`, params);
+
+            if (functionMapping[tool_name]) {
+              const toolOutput = functionMapping[tool_name](...params);
+
+              console.log(`Tool Output (${tool_name}):`, toolOutput);
+
+              messages.push({
+                role: "tool",
+                name: tool_name,
+                content: toolOutput,
+              });
+
+              continue;
             }
           }
           break;
-        case "text":
-          {
+        }
+
+        case "text": {
+          console.log("Text:", parsedOutput.text_content);
+          if (parsedOutput.finalOutput) {
             return parsedOutput.text_content;
           }
           break;
+        }
       }
-
-      const output = response.choices[0].message.content;
-
-      console.log("Agent Says:", output);
-
-      return output;
     } catch (error) {
       console.error("Error:", error);
       return "Something went wrong";
@@ -104,6 +139,4 @@ export async function run(query = "") {
 }
 
 // test
-// console.log(executeCommand("mkdir ayush"));
-
-run("make a folder named test");
+run("make a folder named iphone");
