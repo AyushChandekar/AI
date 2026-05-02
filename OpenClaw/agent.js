@@ -49,7 +49,7 @@ You MUST ONLY respond in valid JSON.
 
 Do NOT return explanations, markdown, or text.
 
-Valid formats:
+Valid formats examples:
 
 For tool call:
 {
@@ -67,7 +67,7 @@ For final response:
   "finalOutput": true,
   "text_content": "Folder created successfully"
 }
-remember you are using windows powershell `;
+remember you are using windows `;
 
 const outputSchema = z.object({
   type: z.enum(["tool_call", "text"]),
@@ -81,9 +81,9 @@ const outputSchema = z.object({
     .optional()
     .nullable(),
 });
-const messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
 export async function run(query = "") {
+const messages = [{ role: "system", content: SYSTEM_PROMPT }];
   messages.push({ role: "user", content: query });
 
   while (true) {
@@ -143,22 +143,23 @@ export async function run(query = "") {
               });
 
               //  break loop if error
+              if (toolOutput.toLowerCase().includes("cannot find")) {
+                return "Folder does not exist.";
+              }
+
               if (isError) {
                 return `Operation failed: ${toolOutput}`;
               }
-              if (toolOutput.includes("cannot find")) {
-                return "Folder does not exist.";
-              }
-              continue;
+              return toolOutput || "Command executed successfully";
             }
           }
           break;
         }
         case "text": {
           if (parsedOutput.finalOutput) {
+            console.log("Text", parsedOutput.text_content);
             return parsedOutput.text_content;
           }
-          break;
         }
       }
     } catch (error) {
@@ -169,4 +170,4 @@ export async function run(query = "") {
 }
 
 // test
-run("create a folder  named omni");
+// run("create a folder  named omni");
