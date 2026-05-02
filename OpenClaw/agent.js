@@ -52,53 +52,61 @@ const functionMapping = {
   writeFile,
 };
 
-const SYSTEM_PROMPT = `You are an expert AI Assistant that is expert in controlling the user's machine. Analyze the user's query carefully and plan the steps on what needs to be done. Based on the user query you can create commands and then call the tool to run that command and execute on the user's machine
+const SYSTEM_PROMPT = `You are an expert AI Assistant that controls the user's Windows machine. Analyze the query carefully, plan every step, execute commands one at a time, and verify results before declaring success.
 
-    Available Tools:
-    - executeCommand(command: string): Output from the command 
-    
-    You can you the executeCommand tool to execute any command on user's machine
-    IMPORTANT:
-You MUST ONLY respond in valid JSON.
+Available Tools:
+- executeCommand(command: string): Runs a shell command and returns its output.
+- writeFile(filename: string, content: string): Writes content to a file. Use this for creating/editing files.
 
-Do NOT return explanations, markdown, or text.
+CRITICAL RULES:
+1. You MUST ONLY respond in valid JSON — no explanations, markdown, or plain text ever.
+2. You MUST break every task into small steps and execute each one with a tool call.
+3. You MUST verify the result after every state-changing operation by running a follow-up command.
+4. NEVER return finalOutput=true unless you have confirmed the task succeeded via a verification command.
+5. For "kill / stop / remove" operations: first query what is running, then stop it, then verify it is gone.
+6. For Docker: always run "docker ps" first to get the container ID, then stop/rm it, then run "docker ps" again to confirm it is no longer listed.
 
-Valid formats examples:
-
-For tool call:
+Response format — tool call:
 {
   "type": "tool_call",
   "finalOutput": false,
   "tool_call": {
     "tool_name": "executeCommand",
-    "params": ["mkdir test"]
+    "params": ["docker ps"]
   }
 }
 
-For final response:
+Response format — write file:
+{
+  "type": "tool_call",
+  "finalOutput": false,
+  "tool_call": {
+    "tool_name": "writeFile",
+    "params": ["index.html", "<html>...</html>"]
+  }
+}
+
+Response format — final answer (ONLY after verification confirms success):
 {
   "type": "text",
   "finalOutput": true,
-  "text_content": "Folder created successfully"
+  "text_content": "Nginx container stopped and removed successfully."
 }
-remember you are using windows 
-You MUST break tasks into multiple steps.
 
-Example for creating a project:
-1. Create folder
-2. Move into folder
-3. Create files
-4. Write content
+Example — stopping a Docker container:
+Step 1: executeCommand("docker ps") → find the container ID
+Step 2: executeCommand("docker stop <id>") → stop it
+Step 3: executeCommand("docker rm <id>") → remove it
+Step 4: executeCommand("docker ps") → confirm it is no longer listed
+Step 5: return finalOutput=true only after confirming it is gone
 
-After each tool execution, continue calling tools until task is complete.
+Example — creating a project:
+Step 1: executeCommand("mkdir myapp")
+Step 2: executeCommand("cd myapp")
+Step 3: writeFile("index.js", "console.log('hello')")
+Step 4: return finalOutput=true
 
-Only return:
-{
-  "type": "text",
-  "finalOutput": true,
-  "text_content": "Task completed"
-}
-when ALL steps are done. `;
+You are on Windows. Use Windows-compatible commands (e.g. "dir" not "ls", "type" not "cat") unless running inside Docker or WSL.`;
 
 const outputSchema = z.object({
   type: z.enum(["tool_call", "text"]),
@@ -124,7 +132,7 @@ export async function run(query = "") {
 
     try {
       const response = await client.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
+        model: "llama-3.1-8b-instant",
         messages: messages,
         temperature: 0.5,
         max_tokens: 4096, // raised — file contents need more tokens
@@ -171,30 +179,23 @@ export async function run(query = "") {
               const toolOutput = functionMapping[tool_name](...params);
               console.log(`Tool Output (${tool_name}):`, toolOutput);
 
-              const isError =
-                toolOutput.toLowerCase().includes("cannot find") ||
-                toolOutput.toLowerCase().includes("not recognized") ||
-                toolOutput.toLowerCase().includes("failed");
-
-              // FIX 3: push the tool result ONCE only (was pushed twice before)
               messages.push({
                 role: "tool",
                 tool_call_id: toolCallId,
                 content: toolOutput,
               });
 
-              if (toolOutput.toLowerCase().includes("cannot find")) {
-                return "Folder does not exist.";
-              }
-
-              if (isError) {
-                return `Operation failed: ${toolOutput}`;
+              // Only hard-abort on "not recognized" — a truly unrecoverable shell error.
+              // Let the model handle all other error strings (docker errors, missing files, etc.)
+              // so it can retry, adjust, or report them in its final answer.
+              if (toolOutput.toLowerCase().includes("is not recognized as an internal or external command")) {
+                return `Command not found: ${toolOutput}`;
               }
 
               messages.push({
                 role: "system",
                 content:
-                  "Continue the task. If all steps are complete, return finalOutput=true.",
+                  "Continue the task. Verify your last action succeeded before moving on. If all steps are complete and verified, return finalOutput=true.",
               });
 
               continue; // go back to top of while loop

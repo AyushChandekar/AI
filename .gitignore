@@ -10,3 +10,11 @@ node_modules/
 
 # OS files
 .DS_Store
+
+
+.claude/
+# Added by code-review-graph
+.code-review-graph/
+
+
+CLAUDE.md
