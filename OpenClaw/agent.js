@@ -2,6 +2,8 @@ import Groq from "groq-sdk";
 import dotenv from "dotenv";
 import { execSync } from "node:child_process";
 import { z } from "zod";
+import crypto from "crypto";
+import os from "os";
 
 dotenv.config();
 
@@ -15,8 +17,18 @@ const client = new Groq({
 
 function executeCommand(cmd = "") {
   try {
+    const platform = os.platform();
+
+    // Fix common commands automatically
+    if (cmd.startsWith("rm")) {
+      const parts = cmd.split(" ");
+      const folder = parts[parts.length - 1];
+
+      cmd = platform === "win32" ? `rmdir /s /q ${folder}` : `rm -rf ${folder}`;
+    }
+
     const result = execSync(cmd, { encoding: "utf-8" });
-    return result;
+    return result || "Command executed successfully";
   } catch (err) {
     return err.message;
   }
@@ -55,7 +67,7 @@ For final response:
   "finalOutput": true,
   "text_content": "Folder created successfully"
 }
-    `;
+remember you are using windows powershell `;
 
 const outputSchema = z.object({
   type: z.enum(["tool_call", "text"]),
@@ -69,7 +81,6 @@ const outputSchema = z.object({
     .optional()
     .nullable(),
 });
-
 const messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
 export async function run(query = "") {
@@ -94,37 +105,56 @@ export async function run(query = "") {
         return rawOutput;
       }
 
-      messages.push({
-        role: "assistant",
-        content: rawOutput,
-      });
-
       switch (parsedOutput.type) {
         case "tool_call": {
           if (parsedOutput.tool_call) {
             const { params, tool_name } = parsedOutput.tool_call;
-
+            const toolCallId = crypto.randomUUID();
             console.log(`Tool Call → ${tool_name}:`, params);
-
+            messages.push({
+              role: "assistant",
+              content: rawOutput,
+              tool_calls: [
+                {
+                  id: toolCallId,
+                  type: "function",
+                  function: {
+                    name: tool_name,
+                    arguments: JSON.stringify({ params }),
+                  },
+                },
+              ],
+            });
             if (functionMapping[tool_name]) {
               const toolOutput = functionMapping[tool_name](...params);
 
               console.log(`Tool Output (${tool_name}):`, toolOutput);
 
+              //  detect failure
+              const isError =
+                toolOutput.toLowerCase().includes("cannot find") ||
+                toolOutput.toLowerCase().includes("not recognized") ||
+                toolOutput.toLowerCase().includes("failed");
+
               messages.push({
                 role: "tool",
-                name: tool_name,
+                tool_call_id: toolCallId,
                 content: toolOutput,
               });
 
+              //  break loop if error
+              if (isError) {
+                return `Operation failed: ${toolOutput}`;
+              }
+              if (toolOutput.includes("cannot find")) {
+                return "Folder does not exist.";
+              }
               continue;
             }
           }
           break;
         }
-
         case "text": {
-          console.log("Text:", parsedOutput.text_content);
           if (parsedOutput.finalOutput) {
             return parsedOutput.text_content;
           }
@@ -139,4 +169,4 @@ export async function run(query = "") {
 }
 
 // test
-run("make a folder named iphone");
+run("create a folder  named omni");
