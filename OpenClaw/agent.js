@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import { execSync } from "node:child_process";
 import { z } from "zod";
 import crypto from "crypto";
-import path from "path";  // FIX 5: use path module for reliable cd handling
+import path from "path"; // FIX 5: use path module for reliable cd handling
 import fs from "fs";
 
 dotenv.config();
@@ -51,6 +51,43 @@ const functionMapping = {
   executeCommand,
   writeFile,
 };
+
+// Extracts the first complete, balanced JSON object from a string.
+// Handles the case where the model outputs multiple JSON blocks or wraps
+// the JSON in extra text / function tags.
+function extractFirstJson(text) {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+// Parses the model's native function-tag format as a fallback:
+//   <function=toolName>{"params":["arg1","arg2"]}</function>
+// Returns a parsedOutput-compatible object, or null if no match.
+function extractFunctionTag(text) {
+  const match = text.match(/<function=(\w+)>([\s\S]*?)<\/function>/);
+  if (!match) return null;
+  try {
+    const tool_name = match[1];
+    const args = JSON.parse(match[2]);
+    const params = Array.isArray(args.params) ? args.params : Object.values(args);
+    return {
+      type: "tool_call",
+      finalOutput: false,
+      tool_call: { tool_name, params },
+    };
+  } catch {
+    return null;
+  }
+}
 
 const SYSTEM_PROMPT = `You are an expert AI Assistant that controls the user's Windows machine. Analyze the query carefully, plan every step, execute commands one at a time, and verify results before declaring success.
 
@@ -106,7 +143,19 @@ Step 2: executeCommand("cd myapp")
 Step 3: writeFile("index.js", "console.log('hello')")
 Step 4: return finalOutput=true
 
-You are on Windows. Use Windows-compatible commands (e.g. "dir" not "ls", "type" not "cat") unless running inside Docker or WSL.`;
+You are on Windows. Use Windows-compatible commands (e.g. "dir" not "ls", "type" not "cat") unless running inside Docker or WSL.
+
+Common Docker image names (use these exact names):
+- Apache HTTP Server → httpd  (e.g. "docker run -d -p 8080:80 httpd")
+- Nginx              → nginx
+- MySQL              → mysql
+- PostgreSQL         → postgres
+- Redis              → redis
+- MongoDB            → mongo
+- Node.js            → node
+- Python             → python
+- Ubuntu             → ubuntu
+When a user says "apache", use "httpd". Never invent image names — use the official ones above.`;
 
 const outputSchema = z.object({
   type: z.enum(["tool_call", "text"]),
@@ -142,15 +191,26 @@ export async function run(query = "") {
 
       let parsedOutput;
       try {
-        const cleanedOutput = rawOutput
-          .replace(/```json/g, "")
-          .replace(/```/g, "")
-          .trim();
-
-        parsedOutput = outputSchema.parse(JSON.parse(cleanedOutput));
+        const stripped = rawOutput.replace(/```json/g, "").replace(/```/g, "");
+        const jsonStr = extractFirstJson(stripped);
+        if (!jsonStr) throw new Error("no JSON block found");
+        parsedOutput = outputSchema.parse(JSON.parse(jsonStr));
       } catch (e) {
-        console.log("Invalid JSON from model:", rawOutput);
-        return rawOutput;
+        // Second attempt: model used its native <function=name>{...}</function> syntax
+        const tagParsed = extractFunctionTag(rawOutput);
+        if (tagParsed) {
+          console.log("Parsed function-tag format:", tagParsed);
+          parsedOutput = tagParsed;
+        } else {
+          console.log("Invalid JSON from model, requesting retry:", rawOutput);
+          messages.push({ role: "assistant", content: rawOutput });
+          messages.push({
+            role: "system",
+            content:
+              "Your last response was not valid JSON. Respond with a single JSON object only — no extra text, no markdown, no function tags. Use the exact format from the system prompt.",
+          });
+          continue;
+        }
       }
 
       switch (parsedOutput.type) {
@@ -188,7 +248,13 @@ export async function run(query = "") {
               // Only hard-abort on "not recognized" — a truly unrecoverable shell error.
               // Let the model handle all other error strings (docker errors, missing files, etc.)
               // so it can retry, adjust, or report them in its final answer.
-              if (toolOutput.toLowerCase().includes("is not recognized as an internal or external command")) {
+              if (
+                toolOutput
+                  .toLowerCase()
+                  .includes(
+                    "is not recognized as an internal or external command",
+                  )
+              ) {
                 return `Command not found: ${toolOutput}`;
               }
 
@@ -213,14 +279,15 @@ export async function run(query = "") {
           messages.push({ role: "assistant", content: rawOutput });
           messages.push({
             role: "system",
-            content: "Continue the task. If all steps are complete, return finalOutput=true.",
+            content:
+              "Continue the task. If all steps are complete, return finalOutput=true.",
           });
           continue;
         }
       }
     } catch (error) {
       console.error("Error:", error);
-      return "Something went wrong";
+      return `Something went wrong: ${error.message}`;
     }
   }
 
